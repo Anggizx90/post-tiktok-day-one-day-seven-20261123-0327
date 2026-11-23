@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pumpkin Pantry — a tiny agent-built game</title>
+<meta name="viewport" content="width=1080, initial-scale=1">
+<style>
+  html, body { margin: 0; padding: 0; width: 1080px; height: 1920px; overflow: hidden; background: #b8c4cc; }
+  canvas { display: block; width: 1080px; height: 1920px; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1080" height="1920"></canvas>
+<script>
+'use strict';
+// Pumpkin Pantry — a tiny basket-catch arcade game, built by an AI agent.
+// Same map, same start, every run: a seeded spawn schedule and a fixed
+// autopilot basket path, so "day one" and "day seven" footage line up
+// frame-for-frame on the identical moment.
+// ?v=1 -> day-one build (minimal).  ?v=7 -> day-seven build (a week of updates).
+const params = new URLSearchParams(location.search);
+const VERSION = params.get('v') === '7' ? 7 : 1;
+
+const W = 1080, H = 1920, GROUND_Y = 1560;
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// ---- deterministic RNG -------------------------------------------------
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rng = mulberry32(20261123);
+
+// ---- spawn schedule (identical in both versions for base pumpkins) ------
+const BASE_TYPES = ['orange'];
+const spawns = [];           // {t, x, kind}
+for (let t = 0.6, i = 0; t < 40; t += 0.9, i++) {
+  spawns.push({ t, x: 90 + rng() * 900, kind: 'orange' });
+}
+const extras = [];           // day-seven only: golden bonuses + rotten hazards
+if (VERSION === 7) {
+  for (let t = 3.2; t < 40; t += 4.1) extras.push({ t, x: 120 + rng() * 840, kind: 'golden' });
+  for (let t = 5.0; t < 40; t += 3.3) extras.push({ t, x: 120 + rng() * 840, kind: 'rotten' });
+}
+const allSpawns = spawns.concat(extras).sort((a, b) => a.t - b.t);
+
+// ---- falling leaves (day seven only, seeded, ambient) --------------------
+const leaves = [];
+if (VERSION === 7) {
+  for (let i = 0; i < 26; i++) {
+    leaves.push({ x: rng() * W, y: rng() * H, s: 10 + rng() * 14, v: 40 + rng() * 60, ph: rng() * 6.28, hue: rng() });
+  }
+}
+
+// ---- game state ---------------------------------------------------------
+const T0 = performance.now();
+let manualT = null;            // set by window.__setTime for frame-stepped capture
+window.__setTime = (t) => { manualT = t; };
+let score = 0, combo = 0, bestCombo = 0, caught = 0, missed = 0;
+let hearts = 3;
+let scorePop = 0;            // score pop animation timer
+const bursts = [];           // catch particle bursts (day 7)
+const splats = [];           // ground splats (day 7)
+const shelf = { orange: 0, golden: 0, striped: 0, tiny: 0 }; // museum shelf
+const caughtKinds = [];
+let levelBanner = null;      // {text, until}
+let bannerShown = { 2: false, 3: false };
+
+function basketX(t) { return 540 + 360 * Math.sin(t * 0.5); } // fixed autopilot path
+
+function spawnState(s, t) {
+  // A pumpkin's fall is a pure function of absolute time: identical every run
+  // and identical in both versions, so the same moment lines up in the cut.
+  const fall = (t - s.t) * 420;
+  return { x: s.x, y: -70 + fall, kind: s.kind };
+}
+
+function pumpkinColor(kind) {
+  if (kind === 'golden') return '#ffc93c';
+  if (kind === 'rotten') return '#7da05c';
+  return '#ff7a1a';
+}
+
+function drawPumpkin(x, y, r, kind, squash) {
+  ctx.save();
+  ctx.translate(x, y);
+  if (squash) ctx.scale(1.15, 0.85);
+  // body
+  ctx.fillStyle = pumpkinColor(kind);
+  ctx.beginPath();
+  ctx.ellipse(0, 0, r, r * 0.88, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // ribs
+  ctx.strokeStyle = 'rgba(0,0,0,0.18)';
+  ctx.lineWidth = 3;
+  for (const off of [-r * 0.45, 0, r * 0.45]) {
+    ctx.beginPath();
+    ctx.ellipse(off, 0, r * 0.32, r * 0.8, 0, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  // stem
+  ctx.strokeStyle = '#4d7c2e';
+  ctx.lineWidth = 7;
+  ctx.beginPath();
+  ctx.moveTo(0, -r * 0.8);
+  ctx.quadraticCurveTo(8, -r * 1.15, 18, -r * 1.2);
+  ctx.stroke();
+  if (kind === 'rotten') {
+    // grumpy face
+    ctx.fillStyle = '#2c3e1e';
+    ctx.beginPath(); ctx.arc(-r * 0.35, -r * 0.15, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(r * 0.35, -r * 0.15, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#2c3e1e'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(-r * 0.4, r * 0.4); ctx.lineTo(r * 0.4, r * 0.25); ctx.stroke();
+  } else if (kind === 'golden') {
+    // sparkle
+    ctx.fillStyle = '#fff6c9';
+    ctx.font = 'bold 34px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('★', 0, -r * 0.1);
+  } else {
+    // happy face
+    ctx.fillStyle = '#3a2200';
+    ctx.beginPath(); ctx.arc(-r * 0.35, -r * 0.15, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(r * 0.35, -r * 0.15, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#3a2200'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(0, r * 0.1, r * 0.4, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawBasket(x) {
+  const y = 1500;
+  ctx.save();
+  ctx.translate(x, y);
+  // woven basket
+  ctx.fillStyle = '#a0662c';
+  ctx.beginPath();
+  ctx.moveTo(-110, -40); ctx.lineTo(110, -40); ctx.lineTo(88, 40); ctx.lineTo(-88, 40);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#7c4a1d';
+  ctx.lineWidth = 5;
+  for (let i = -2; i <= 2; i++) {
+    ctx.beginPath(); ctx.moveTo(-95 + i * 0, -20 + i * 18); ctx.lineTo(95, -20 + i * 18); ctx.stroke();
+  }
+  ctx.fillStyle = '#c98a45';
+  ctx.fillRect(-118, -52, 236, 16);
+  if (VERSION === 7) {
+    // upgraded basket: little wheels + flag
+    ctx.fillStyle = '#333';
+    ctx.beginPath(); ctx.arc(-70, 52, 14, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(70, 52, 14, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#5b3a17'; ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(100, -52); ctx.lineTo(100, -110); ctx.stroke();
+    ctx.fillStyle = '#ff5a76';
+    ctx.beginPath(); ctx.moveTo(100, -110); ctx.lineTo(148, -96); ctx.lineTo(100, -80); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawBackground(t) {
+  if (VERSION === 1) {
+    // day one: flat, bare, grey-blue sky and a flat green strip
+    ctx.fillStyle = '#b8c4cc';
+    ctx.fillRect(0, 0, W, GROUND_Y);
+    ctx.fillStyle = '#7fae5a';
+    ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+    ctx.fillStyle = '#6d9c4c';
+    ctx.fillRect(0, GROUND_Y, W, 10);
+  } else {
+    // day seven: warm sunset gradient, sun, drifting clouds, parallax hills
+    const g = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+    g.addColorStop(0, '#ff9d5c');
+    g.addColorStop(0.55, '#ffb37a');
+    g.addColorStop(1, '#ffd9a0');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, GROUND_Y);
+    // sun
+    ctx.fillStyle = '#fff3c4';
+    ctx.beginPath(); ctx.arc(830, 300, 110, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(255,243,196,0.35)';
+    ctx.beginPath(); ctx.arc(830, 300, 160, 0, Math.PI * 2); ctx.fill();
+    // clouds drift with time
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    for (let i = 0; i < 4; i++) {
+      const cx = ((i * 320 + t * 22) % (W + 360)) - 180;
+      const cy = 180 + i * 130;
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, 110, 34, 0, 0, Math.PI * 2);
+      ctx.ellipse(cx + 70, cy + 12, 80, 28, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // far hills
+    ctx.fillStyle = '#c98a5a';
+    ctx.beginPath();
+    ctx.moveTo(0, GROUND_Y);
+    for (let x = 0; x <= W; x += 60) ctx.lineTo(x, GROUND_Y - 120 - 60 * Math.sin(x * 0.006 + 1.2));
+    ctx.lineTo(W, GROUND_Y); ctx.closePath(); ctx.fill();
+    // near hills
+    ctx.fillStyle = '#8fae5a';
+    ctx.beginPath();
+    ctx.moveTo(0, GROUND_Y);
+    for (let x = 0; x <= W; x += 60) ctx.lineTo(x, GROUND_Y - 46 - 34 * Math.sin(x * 0.009 + 4.0));
+    ctx.lineTo(W, GROUND_Y); ctx.closePath(); ctx.fill();
+    // ground with soil strip
+    ctx.fillStyle = '#6f9e4e';
+    ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+    ctx.fillStyle = '#5d8a42';
+    ctx.fillRect(0, GROUND_Y, W, 12);
+    // falling leaves
+    for (const lf of leaves) {
+      const ly = (lf.y + t * lf.v) % (H + 40) - 20;
+      const lx = lf.x + 40 * Math.sin(t * 1.3 + lf.ph);
+      ctx.save();
+      ctx.translate(lx, ly);
+      ctx.rotate(Math.sin(t * 2 + lf.ph) * 0.8);
+      ctx.fillStyle = lf.hue > 0.5 ? '#e8a13c' : '#d96a3b';
+      ctx.beginPath(); ctx.ellipse(0, 0, lf.s, lf.s * 0.55, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+  }
+}
+
+function drawHUD(t) {
+  // score, top-left
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  const pop = scorePop > 0 ? 1 + 0.35 * scorePop : 1;
+  ctx.save();
+  ctx.translate(56, 128);
+  ctx.scale(pop, pop);
+  ctx.font = '900 96px sans-serif';
+  ctx.fillStyle = VERSION === 7 ? '#fff8e6' : '#ffffff';
+  ctx.shadowColor = 'rgba(0,0,0,0.35)'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 6;
+  ctx.fillText(String(score), 0, 0);
+  ctx.restore();
+  ctx.font = '700 34px sans-serif';
+  ctx.fillStyle = VERSION === 7 ? '#fff8e6' : 'rgba(255,255,255,0.9)';
+  ctx.shadowOffsetY = 3;
+  ctx.fillText('SCORE', 58, 168);
+  ctx.shadowOffsetY = 0;
+
+  // day pill, top-right
+  const label = VERSION === 7 ? 'DAY 7' : 'DAY 1';
+  ctx.font = '900 44px sans-serif';
+  const tw = ctx.measureText(label).width;
+  const px = W - 56 - tw - 44;
+  ctx.fillStyle = VERSION === 7 ? '#ff5a76' : 'rgba(40,50,60,0.55)';
+  ctx.beginPath();
+  ctx.roundRect(px, 78, tw + 44, 66, 33);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'left';
+  ctx.fillText(label, px + 22, 124);
+
+  if (VERSION === 7) {
+    // hearts under the score
+    for (let i = 0; i < 3; i++) {
+      ctx.font = '44px sans-serif';
+      ctx.fillText(i < hearts ? '❤️' : '🖤', 58 + i * 56, 232);
+    }
+    // combo
+    if (combo >= 2) {
+      ctx.font = '900 52px sans-serif';
+      ctx.fillStyle = '#ffd23c';
+      ctx.shadowColor = 'rgba(0,0,0,0.4)'; ctx.shadowOffsetY = 4;
+      ctx.fillText('COMBO x' + combo, 58, 300);
+      ctx.shadowOffsetY = 0;
+    }
+    // level banners
+    if (levelBanner && t < levelBanner.until) {
+      const a = Math.min(1, (levelBanner.until - t) * 2, (t - levelBanner.from) * 3);
+      ctx.globalAlpha = a;
+      ctx.font = '900 64px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff8e6';
+      ctx.shadowColor = 'rgba(0,0,0,0.45)'; ctx.shadowOffsetY = 6;
+      ctx.fillText(levelBanner.text, W / 2, 560);
+      ctx.font = '700 36px sans-serif';
+      ctx.fillText(levelBanner.sub, W / 2, 616);
+      ctx.shadowOffsetY = 0;
+      ctx.globalAlpha = 1;
+      ctx.textAlign = 'left';
+    }
+    // museum shelf: collected pumpkins on display
+    ctx.fillStyle = 'rgba(60,30,10,0.55)';
+    ctx.beginPath(); ctx.roundRect(56, 1660, 968, 150, 24); ctx.fill();
+    ctx.fillStyle = '#fff8e6';
+    ctx.font = '700 30px sans-serif';
+    ctx.fillText('🎃  PUMPKIN-BREAD MUSEUM', 84, 1704);
+    let sx = 90;
+    for (const k of caughtKinds.slice(-10)) {
+      drawPumpkin(sx + 34, 1760, 30, k, false);
+      sx += 84;
+    }
+  }
+}
+
+function frame() {
+  const t = manualT !== null ? manualT : (performance.now() - T0) / 1000;
+  if (scorePop > 0) scorePop -= 0.03;
+
+  // level banners on the day-seven build
+  if (VERSION === 7) {
+    if (t > 6 && !bannerShown[2]) { bannerShown[2] = true; levelBanner = { text: 'LEVEL 2!', sub: 'golden pumpkins worth 50', from: t, until: t + 2.2 }; }
+    if (t > 12 && !bannerShown[3]) { bannerShown[3] = true; levelBanner = { text: 'LEVEL 3!', sub: 'watch out for rotten ones', from: t, until: t + 2.2 }; }
+  }
+
+  drawBackground(t);
+
+  // active pumpkins: resolve catches / misses deterministically per frame
+  const bx = basketX(t);
+  for (const s of allSpawns) {
+    if (t < s.t || t > s.t + 6) continue;
+    const p = spawnState(s, t);
+    const r = s.kind === 'golden' ? 52 : 46;
+    if (p.y > GROUND_Y - 10) {
+      // reached the ground
+      if (!s.resolved) {
+        s.resolved = true;
+        if (Math.abs(p.x - bx) < 130) {
+          // caught in the basket
+          caught++;
+          const pts = s.kind === 'golden' ? 50 : 10;
+          score += pts * (VERSION === 7 ? Math.max(1, combo) : 1);
+          combo++; bestCombo = Math.max(bestCombo, combo);
+          scorePop = 1;
+          caughtKinds.push(s.kind);
+          if (VERSION === 7) {
+            for (let i = 0; i < 14; i++) {
+              bursts.push({ x: p.x, y: 1470, vx: (Math.random() - 0.5) * 420, vy: -120 - Math.random() * 260, life: 0.7, col: s.kind === 'golden' ? '#ffd23c' : '#ff9d5c' });
+            }
+          }
+        } else {
+          // missed: hits the ground
+          missed++;
+          if (s.kind === 'rotten') { /* rotten ones just thud */ }
+          else {
+            combo = 0;
+            if (VERSION === 7) {
+              hearts = Math.max(0, hearts - (missed % 3 === 0 ? 1 : 0));
+              splats.push({ x: p.x, y: GROUND_Y + 14, life: 1.6, col: '#ff7a1a' });
+            }
+          }
+        }
+      }
+      continue;
+    }
+    if (p.y < -80) continue;
+    // squash as it nears the basket
+    const squash = Math.abs(p.y - 1460) < 60 && Math.abs(p.x - bx) < 130;
+    drawPumpkin(p.x, p.y, r, s.kind, squash);
+  }
+
+  // splats (day 7)
+  for (let i = splats.length - 1; i >= 0; i--) {
+    const sp = splats[i];
+    sp.life -= 0.016;
+    if (sp.life <= 0) { splats.splice(i, 1); continue; }
+    ctx.globalAlpha = Math.min(1, sp.life);
+    ctx.fillStyle = sp.col;
+    ctx.beginPath(); ctx.ellipse(sp.x, sp.y, 46, 12, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  // bursts (day 7)
+  for (let i = bursts.length - 1; i >= 0; i--) {
+    const b = bursts[i];
+    b.life -= 0.016;
+    if (b.life <= 0) { bursts.splice(i, 1); continue; }
+    b.x += b.vx * 0.016; b.y += b.vy * 0.016; b.vy += 500 * 0.016;
+    ctx.globalAlpha = Math.min(1, b.life * 2);
+    ctx.fillStyle = b.col;
+    ctx.beginPath(); ctx.arc(b.x, b.y, 7, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  drawBasket(bx);
+  drawHUD(t);
+
+  // day-one build: a quiet "just the basics" caption line at the bottom
+  if (VERSION === 1) {
+    ctx.font = '600 32px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.fillText('one pumpkin · one basket · that\'s it', W / 2, 1860);
+    ctx.textAlign = 'left';
+  }
+
+  window.__ready = true;
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

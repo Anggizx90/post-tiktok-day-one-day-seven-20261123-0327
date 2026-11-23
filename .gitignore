@@ -1,0 +1,9 @@
+out/
+work/frames/
+work/press/
+work/check/
+work/*.mp4
+work/*.wav
+work/concat.txt
+work/d1.mp4
+work/d7.mp4
